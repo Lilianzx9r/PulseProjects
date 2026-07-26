@@ -39,7 +39,8 @@ class _BrowserTab {
   final String homeUrl;
 
   WinWebViewController? ctrl;
-  final TextEditingController urlCtrl = TextEditingController();
+  final TextEditingController urlCtrl  = TextEditingController();
+  final FocusNode             urlFocus = FocusNode();
 
   bool    loading  = true;
   double  progress = 0;
@@ -134,7 +135,8 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
           'window.location.href',
         );
         final url = raw.toString().replaceAll('"', '').trim();
-        if (url.isNotEmpty && url.startsWith('http') && url != tab.urlCtrl.text) {
+        if (url.isNotEmpty && url.startsWith('http') && url != tab.urlCtrl.text
+            && !tab.urlFocus.hasFocus) {
           if (mounted) setState(() => tab.urlCtrl.text = url);
         }
       } catch (_) {}
@@ -183,6 +185,7 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
     }
     setState(() {
       _tabs[i].urlCtrl.dispose();
+      _tabs[i].urlFocus.dispose();
       _tabs.removeAt(i);
       if (_activeIndex >= _tabs.length) {
         _activeIndex = _tabs.length - 1;
@@ -227,7 +230,7 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
         onPageStarted: (url) {
           if (!mounted) return;
           setState(() { tab.loading = true; tab.progress = 0; });
-          if (url.isNotEmpty) tab.urlCtrl.text = url;
+          if (url.isNotEmpty && !tab.urlFocus.hasFocus) tab.urlCtrl.text = url;
         },
         onProgress: (pct) {
           if (!mounted) return;
@@ -236,7 +239,7 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
         onPageFinished: (url) async {
           if (!mounted) return;
           setState(() { tab.loading = false; tab.progress = 1.0; });
-          if (url.isNotEmpty) tab.urlCtrl.text = url;
+          if (url.isNotEmpty && !tab.urlFocus.hasFocus) tab.urlCtrl.text = url;
           try {
             final raw = await ctrl.runJavaScriptReturningResult('document.title');
             final t   = raw.toString().replaceAll('"', '').trim();
@@ -359,6 +362,7 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
     ProcessTracker.deletePid(widget.project.id);
     for (final tab in _tabs) {
       tab.urlCtrl.dispose();
+      tab.urlFocus.dispose();
     }
     super.dispose();
   }
@@ -390,6 +394,7 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
           _Toolbar(
             ctrl:          _active.ctrl!,
             urlCtrl:       _active.urlCtrl,
+            urlFocus:      _active.urlFocus,
             loading:       _active.loading,
             showTerm:      _showTerm,
             showExtBar:    _showExtBar,
@@ -494,11 +499,13 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
 class _Toolbar extends StatelessWidget {
   final WinWebViewController  ctrl;
   final TextEditingController urlCtrl;
+  final FocusNode              urlFocus;
   final bool loading, showTerm, showExtBar;
   final VoidCallback onNavigate, onToggleTerm, onToggleExt, onScript;
 
   const _Toolbar({
     required this.ctrl,      required this.urlCtrl,
+    required this.urlFocus,
     required this.loading,   required this.showTerm,
     required this.showExtBar,
     required this.onNavigate, required this.onToggleTerm,
@@ -524,6 +531,7 @@ class _Toolbar extends StatelessWidget {
         Expanded(
           child: TextField(
             controller: urlCtrl,
+            focusNode:  urlFocus,
             decoration: InputDecoration(
               isDense: true,
               contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),

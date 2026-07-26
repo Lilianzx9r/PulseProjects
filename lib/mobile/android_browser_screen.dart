@@ -16,7 +16,8 @@ class _MobileTab {
   final String homeUrl;
 
   late final WebViewController ctrl;
-  final TextEditingController urlCtrl = TextEditingController();
+  final TextEditingController urlCtrl  = TextEditingController();
+  final FocusNode              urlFocus = FocusNode();
 
   bool loading = true;
   String title = '';
@@ -58,6 +59,7 @@ class _AndroidBrowserScreenState extends State<AndroidBrowserScreen> {
   void dispose() {
     for (final tab in _tabs) {
       tab.urlCtrl.dispose();
+      tab.urlFocus.dispose();
     }
     super.dispose();
   }
@@ -75,11 +77,13 @@ class _AndroidBrowserScreenState extends State<AndroidBrowserScreen> {
       ..setNavigationDelegate(NavigationDelegate(
         onPageStarted: (u) {
           if (!mounted) return;
-          setState(() { tab.loading = true; tab.urlCtrl.text = u; });
+          setState(() { tab.loading = true; });
+          if (!tab.urlFocus.hasFocus) tab.urlCtrl.text = u;
         },
         onPageFinished: (u) async {
           if (!mounted) return;
-          setState(() { tab.loading = false; tab.urlCtrl.text = u; });
+          setState(() { tab.loading = false; });
+          if (!tab.urlFocus.hasFocus) tab.urlCtrl.text = u;
           try {
             final raw = await tab.ctrl.runJavaScriptReturningResult('document.title');
             final t   = raw.toString().replaceAll('"', '').trim();
@@ -111,6 +115,7 @@ class _AndroidBrowserScreenState extends State<AndroidBrowserScreen> {
     }
     setState(() {
       _tabs[i].urlCtrl.dispose();
+      _tabs[i].urlFocus.dispose();
       _tabs.removeAt(i);
       if (_activeIndex >= _tabs.length) {
         _activeIndex = _tabs.length - 1;
@@ -186,6 +191,7 @@ class _AndroidBrowserScreenState extends State<AndroidBrowserScreen> {
             Expanded(
               child: TextField(
                 controller: _active.urlCtrl,
+                focusNode:  _active.urlFocus,
                 decoration: InputDecoration(
                   isDense: true,
                   contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
