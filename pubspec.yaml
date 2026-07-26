@@ -1,0 +1,50 @@
+name: pulse_projects
+description: PulseProjects — Lanceur de profils WebView isolés pour Windows, macOS et Android.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ── WebView ───────────────────────────────────────────────────────────────
+  # Windows : webview_win_floating (WebView2, natif Win32 flottant)
+  # macOS   : plugin Swift custom (lib/browser/macos_webview.dart) — WKWebView
+  #           + WKWebsiteDataStore isolé par profil. Pas de package pub.dev
+  #           macOS car webview_flutter_wkwebview n'expose pas encore
+  #           WKWebsiteDataStore(forIdentifier:) à ce jour.
+  # Android : webview_flutter (implémentation Android officielle, isolation
+  #           via WebView.setDataDirectorySuffix() côté natif Kotlin —
+  #           voir android/app/.../PulseApplication.kt).
+  webview_flutter: ^4.13.0
+  webview_win_floating: ^3.0.2   # Windows uniquement (no-op au build macOS/Android)
+
+  # ── UI / Fenêtres ─────────────────────────────────────────────────────────
+  window_manager: ^0.3.7          # Windows/macOS uniquement (non utilisé sur Android)
+
+  # ── Sélecteur de fichier cross-platform (Windows/macOS) ──────────────────
+  file_selector: ^0.9.0
+  file_selector_platform_interface: ^2.6.0
+
+  # ── Stockage Android (profil actif + liste des profils) ──────────────────
+  shared_preferences: ^2.2.3
+  path_provider: ^2.1.3
+
+  # ── Utilitaires ───────────────────────────────────────────────────────────
+  path: ^1.9.0
+  uuid: ^4.2.1
+  ffi: ^2.1.0
+
+  # ── Export/Import (cross-platform) ───────────────────────────────────────
+  archive: ^3.6.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
