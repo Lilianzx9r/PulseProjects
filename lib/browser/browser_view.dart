@@ -6,6 +6,8 @@ import 'package:webview_win_floating/webview_win_floating.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../common/app_settings.dart';
+import '../common/browser_history_entry.dart';
+import '../common/browser_history_store.dart';
 import '../common/process_tracker.dart';
 import '../common/script_store.dart';
 import '../common/terminal_history_store.dart';
@@ -29,31 +31,19 @@ class BrowserView extends StatefulWidget {
   State<BrowserView> createState() => _BrowserViewState();
 }
 
-/// État d'un onglet du navigateur : un controller WebView2 dédié (même
-/// profil que les autres onglets → session/cookies partagés), sa barre
-/// d'URL, et son statut de chargement.
-class _BrowserTab {
-  _BrowserTab({required this.id, required this.homeUrl});
-
-  final String id;
-  final String homeUrl;
-
-  WinWebViewController? ctrl;
-  final TextEditingController urlCtrl  = TextEditingController();
-  final FocusNode             urlFocus = FocusNode();
-
-  bool    loading  = true;
-  double  progress = 0;
-  String? error;
-  String  title    = '';
-}
-
 class _BrowserViewState extends State<BrowserView> with WindowListener, DownloadWatcherMixin<BrowserView> {
-  final List<_BrowserTab> _tabs = [];
-  int _activeIndex = 0;
-  Timer? _urlPollTimer;
+  WinWebViewController? _ctrl;
+  final _urlCtrl  = TextEditingController();
+  final _urlFocus = FocusNode();
 
-  _BrowserTab get _active => _tabs[_activeIndex];
+  bool   _loading       = true;
+  double _progress      = 0;
+  String? _error;
+  Timer?  _urlPollTimer;
+
+  // ── Historique de navigation (persistant, par profil) ──────────────────────
+  bool                        _showHistory = false;
+  List<BrowserHistoryEntry>   _history     = [];
 
   // ── Terminal intégré ───────────────────────────────────────────────────────
   bool   _showTerm  = false;
@@ -88,6 +78,7 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
     windowManager.setPreventClose(true);
     ProcessTracker.writePid(widget.project.id);
     _loadTerminalHistory();
+    _loadBrowserHistory();
     _init();
     _initWatcher();
   }
@@ -104,120 +95,63 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
     }
   }
 
+  Future<void> _loadBrowserHistory() async {
+    final history = await BrowserHistoryStore.load(widget.project.id);
+    if (mounted) setState(() => _history = history);
+  }
+
+  Future<void> _recordVisit(String url, String title) async {
+    if (url.isEmpty) return;
+    final entry = BrowserHistoryEntry(
+      url: url, title: title, visitedAt: DateTime.now());
+    final updated = await BrowserHistoryStore.append(widget.project.id, entry);
+    if (mounted) setState(() => _history = updated);
+  }
+
+  Future<void> _clearHistory() async {
+    await BrowserHistoryStore.clear(widget.project.id);
+    if (mounted) setState(() => _history = []);
+  }
+
   @override
   void onWindowClose() async {
     await ProcessTracker.deletePid(widget.project.id);
     await windowManager.destroy();
   }
 
-  // ── Init WebView / Onglets ───────────────────────────────────────────────
-  //
-  // Chaque onglet possède son propre WinWebViewController (même profil,
-  // même userDataFolder → cookies/session partagés entre onglets, comme
-  // dans un navigateur classique). Un seul WinWebViewWidget est monté à la
-  // fois (celui de l'onglet actif) : voir la note Z-order dans build() —
-  // insérer plusieurs WebView2 flottantes simultanément casserait leur
-  // empilement natif. Changer d'onglet ne détruit pas le controller (donc
-  // pas de perte de session), seul l'attachement du widget change.
+  // ── Init WebView ──────────────────────────────────────────────────────────
 
   Future<void> _init() async {
-    await _openTab(widget.project.homeUrl, activate: true);
-
-    // Polling URL via JS — plus fiable que currentUrl() qui ne se met
-    // pas à jour pour les navigations SPA (history.pushState). Ne
-    // concerne que l'onglet actif (seul dont l'URL est affichée).
-    _urlPollTimer = Timer.periodic(const Duration(milliseconds: 600), (_) async {
-      if (!mounted || _tabs.isEmpty) return;
-      final tab = _active;
-      if (tab.ctrl == null) return;
-      try {
-        final raw = await tab.ctrl!.runJavaScriptReturningResult(
-          'window.location.href',
-        );
-        final url = raw.toString().replaceAll('"', '').trim();
-        if (url.isNotEmpty && url.startsWith('http') && url != tab.urlCtrl.text
-            && !tab.urlFocus.hasFocus) {
-          if (mounted) setState(() => tab.urlCtrl.text = url);
-        }
-      } catch (_) {}
-    });
-  }
-
-  /// Crée un nouvel onglet, charge [url], et l'ajoute à la liste. Si
-  /// [activate] est vrai (par défaut), l'onglet devient l'onglet actif.
-  Future<_BrowserTab> _openTab(String url, {bool activate = true}) async {
-    final tab = _BrowserTab(
-      id:      '${DateTime.now().microsecondsSinceEpoch}',
-      homeUrl: url,
-    );
-    tab.urlCtrl.text = url;
     try {
-      final ctrl = _buildController(tab);
-      await ctrl.loadRequest(Uri.parse(url));
-      tab.ctrl = ctrl;
-    } catch (e) {
-      tab.error   = e.toString();
-      tab.loading = false;
-    }
-    if (mounted) {
-      setState(() {
-        _tabs.add(tab);
-        if (activate) _activeIndex = _tabs.length - 1;
+      final ctrl = _buildController();
+      await ctrl.loadRequest(Uri.parse(widget.project.homeUrl));
+      if (!mounted) return;
+      setState(() => _ctrl = ctrl);
+
+      // Polling URL via JS — plus fiable que currentUrl() qui ne se met
+      // pas à jour pour les navigations SPA (history.pushState).
+      // runJavaScriptReturningResult est garanti de fonctionner car on
+      // l'utilise déjà pour document.title.
+      _urlPollTimer = Timer.periodic(const Duration(milliseconds: 600), (_) async {
+        if (!mounted || _ctrl == null) return;
+        try {
+          final raw = await _ctrl!.runJavaScriptReturningResult(
+            'window.location.href',
+          );
+          final url = raw.toString().replaceAll('"', '').trim();
+          if (url.isNotEmpty && url.startsWith('http') && url != _urlCtrl.text
+              && !_urlFocus.hasFocus) {
+            if (mounted) setState(() => _urlCtrl.text = url);
+          }
+        } catch (_) {}
       });
-    }
-    return tab;
-  }
-
-  void _addTab() => _openTab(widget.project.homeUrl, activate: true);
-
-  void _selectTab(int i) {
-    if (i == _activeIndex) return;
-    setState(() => _activeIndex = i);
-    _updateWindowTitle();
-  }
-
-  void _closeTab(int i) {
-    if (_tabs.length <= 1) {
-      // Fermer le dernier onglet ferme la fenêtre du navigateur, comme
-      // dans un navigateur classique.
-      onWindowClose();
-      return;
-    }
-    setState(() {
-      _tabs[i].urlCtrl.dispose();
-      _tabs[i].urlFocus.dispose();
-      _tabs.removeAt(i);
-      if (_activeIndex >= _tabs.length) {
-        _activeIndex = _tabs.length - 1;
-      } else if (i < _activeIndex) {
-        _activeIndex--;
-      }
-    });
-    _updateWindowTitle();
-  }
-
-  Future<void> _retryActiveTab() async {
-    final tab = _active;
-    setState(() { tab.error = null; tab.loading = true; });
-    try {
-      final ctrl = _buildController(tab);
-      await ctrl.loadRequest(Uri.parse(tab.homeUrl));
-      if (!mounted) return;
-      setState(() => tab.ctrl = ctrl);
     } catch (e) {
       if (!mounted) return;
-      setState(() { tab.error = e.toString(); tab.loading = false; });
+      setState(() { _error = e.toString(); _loading = false; });
     }
   }
 
-  void _updateWindowTitle() {
-    if (_tabs.isEmpty) return;
-    final t = _active.title;
-    windowManager.setTitle(
-      t.isNotEmpty ? '${widget.project.name} – $t' : widget.project.name);
-  }
-
-  WinWebViewController _buildController(_BrowserTab tab) {
+  WinWebViewController _buildController() {
     final params = WindowsWebViewControllerCreationParams(
       userDataFolder: widget.dataDir,
       profileName:    'pulse_${widget.project.id}',
@@ -229,29 +163,33 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
       ..setNavigationDelegate(WinNavigationDelegate(
         onPageStarted: (url) {
           if (!mounted) return;
-          setState(() { tab.loading = true; tab.progress = 0; });
-          if (url.isNotEmpty && !tab.urlFocus.hasFocus) tab.urlCtrl.text = url;
+          setState(() { _loading = true; _progress = 0; });
+          if (url.isNotEmpty && !_urlFocus.hasFocus) _urlCtrl.text = url;
         },
         onProgress: (pct) {
           if (!mounted) return;
-          setState(() => tab.progress = pct / 100.0);
+          setState(() => _progress = pct / 100.0);
         },
         onPageFinished: (url) async {
           if (!mounted) return;
-          setState(() { tab.loading = false; tab.progress = 1.0; });
-          if (url.isNotEmpty && !tab.urlFocus.hasFocus) tab.urlCtrl.text = url;
+          setState(() { _loading = false; _progress = 1.0; });
+          if (url.isNotEmpty && !_urlFocus.hasFocus) _urlCtrl.text = url;
+          String pageTitle = '';
           try {
             final raw = await ctrl.runJavaScriptReturningResult('document.title');
-            final t   = raw.toString().replaceAll('"', '').trim();
-            if (mounted) setState(() => tab.title = t);
-          } catch (_) {}
-          if (_tabs.isNotEmpty && identical(tab, _active)) _updateWindowTitle();
+            pageTitle = raw.toString().replaceAll('"', '').trim();
+            windowManager.setTitle(
+              pageTitle.isNotEmpty ? '${widget.project.name} – $pageTitle' : widget.project.name);
+          } catch (_) {
+            windowManager.setTitle(widget.project.name);
+          }
+          if (url.isNotEmpty) _recordVisit(url, pageTitle);
           // Watcher SPA : détecte pushState/replaceState/popstate
           // pour mettre à jour l'URL immédiatement sans attendre le poll.
           _injectUrlWatcher(ctrl);
         },
         onWebResourceError: (_) {
-          if (mounted) setState(() => tab.loading = false);
+          if (mounted) setState(() => _loading = false);
         },
       ));
     return ctrl;
@@ -279,11 +217,10 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
   // ── Navigation ────────────────────────────────────────────────────────────
 
   void _navigate() {
-    if (_tabs.isEmpty) return;
-    var v = _active.urlCtrl.text.trim();
+    var v = _urlCtrl.text.trim();
     if (v.isEmpty) return;
     if (!v.startsWith('http://') && !v.startsWith('https://')) v = 'https://$v';
-    _active.ctrl?.loadRequest(Uri.parse(v));
+    _ctrl?.loadRequest(Uri.parse(v));
   }
 
   // ── Terminal externe ─────────────────────────────────────────────────────
@@ -360,10 +297,8 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
     stopWatcher();
     windowManager.removeListener(this);
     ProcessTracker.deletePid(widget.project.id);
-    for (final tab in _tabs) {
-      tab.urlCtrl.dispose();
-      tab.urlFocus.dispose();
-    }
+    _urlCtrl.dispose();
+    _urlFocus.dispose();
     super.dispose();
   }
 
@@ -371,43 +306,39 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
 
   @override
   Widget build(BuildContext context) {
-    if (_tabs.isEmpty) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    if (_error != null && _ctrl == null) {
+      return _ErrorView(error: _error!, onRetry: () {
+        setState(() { _error = null; _loading = true; });
+        _init();
+      });
     }
-    if (_active.error != null && _active.ctrl == null) {
-      return _ErrorView(error: _active.error!, onRetry: _retryActiveTab);
+    if (_ctrl == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
     }
 
     return Scaffold(
       body: SafeArea(
         child: Column(children: [
-          // ── Barre d'onglets ────────────────────────────────────────────
-          _TabStrip(
-            tabs:        _tabs,
-            activeIndex: _activeIndex,
-            onSelect:    _selectTab,
-            onClose:     _closeTab,
-            onAdd:       _addTab,
-          ),
-
           // ── Toolbar ────────────────────────────────────────────────────
           _Toolbar(
-            ctrl:          _active.ctrl!,
-            urlCtrl:       _active.urlCtrl,
-            urlFocus:      _active.urlFocus,
-            loading:       _active.loading,
+            ctrl:          _ctrl!,
+            urlCtrl:       _urlCtrl,
+            urlFocus:      _urlFocus,
+            loading:       _loading,
             showTerm:      _showTerm,
             showExtBar:    _showExtBar,
+            showHistory:   _showHistory,
             onNavigate:    _navigate,
             onToggleTerm:  () => setState(() => _showTerm = !_showTerm),
             onToggleExt:   () => setState(() => _showExtBar = !_showExtBar),
             onScript:      () => setState(() => _showScript = !_showScript),
+            onToggleHistory: () => setState(() => _showHistory = !_showHistory),
           ),
 
           // ── Barre de progression ───────────────────────────────────────
-          if (_active.loading)
+          if (_loading)
             LinearProgressIndicator(
-              value:           _active.progress,
+              value:           _progress,
               minHeight:       2,
               backgroundColor: Colors.transparent,
             ),
@@ -427,10 +358,8 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
           // intégré ci-dessous.
           Expanded(
             child: Column(children: [
-              // WebView occupe tout l'espace restant. Un seul onglet est
-              // monté à la fois (celui actif) — voir note dans
-              // _openTab().
-              Expanded(child: WinWebViewWidget(controller: _active.ctrl!)),
+              // WebView occupe tout l'espace restant
+              Expanded(child: WinWebViewWidget(controller: _ctrl!)),
 
               // ── Barre terminal externe (inline, sous la WebView) ────────
               if (_showExtBar)
@@ -449,6 +378,19 @@ class _BrowserViewState extends State<BrowserView> with WindowListener, Download
                   onSave:         _saveScript,
                   onExecute:      _executeScript,
                   onClose:        () => setState(() => _showScript = false),
+                ),
+
+              // ── Panneau Historique (inline, sous la WebView) ────────────
+              if (_showHistory)
+                _HistoryPanel(
+                  entries:  _history,
+                  onOpen:   (url) {
+                    _urlCtrl.text = url;
+                    _navigate();
+                    setState(() => _showHistory = false);
+                  },
+                  onClear:  _clearHistory,
+                  onClose:  () => setState(() => _showHistory = false),
                 ),
 
               // Séparateur + panneau terminal (uniquement si ouvert)
@@ -500,16 +442,17 @@ class _Toolbar extends StatelessWidget {
   final WinWebViewController  ctrl;
   final TextEditingController urlCtrl;
   final FocusNode              urlFocus;
-  final bool loading, showTerm, showExtBar;
-  final VoidCallback onNavigate, onToggleTerm, onToggleExt, onScript;
+  final bool loading, showTerm, showExtBar, showHistory;
+  final VoidCallback onNavigate, onToggleTerm, onToggleExt, onScript, onToggleHistory;
 
   const _Toolbar({
     required this.ctrl,      required this.urlCtrl,
     required this.urlFocus,
     required this.loading,   required this.showTerm,
-    required this.showExtBar,
+    required this.showExtBar, required this.showHistory,
     required this.onNavigate, required this.onToggleTerm,
     required this.onToggleExt, required this.onScript,
+    required this.onToggleHistory,
   });
 
   @override
@@ -575,6 +518,18 @@ class _Toolbar extends StatelessWidget {
             onPressed: onToggleExt,
           ),
         ),
+        // Bouton Historique
+        Tooltip(
+          message: showHistory ? 'Fermer l\'historique' : 'Historique de navigation',
+          child: IconButton(
+            icon:  Icon(showHistory ? Icons.history : Icons.history_outlined),
+            style: showHistory
+                ? IconButton.styleFrom(backgroundColor: cs.primaryContainer)
+                : null,
+            color: showHistory ? cs.primary : null,
+            onPressed: onToggleHistory,
+          ),
+        ),
         // Bouton Script personnalisé (éditable, dossier d'exécution configurable)
         IconButton(
           tooltip: 'Script personnalisé',
@@ -587,92 +542,103 @@ class _Toolbar extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Barre d'onglets
+// Panneau Historique (inline, sous la WebView — même raison Z-order que
+// les autres panneaux de cette fenêtre)
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _TabStrip extends StatelessWidget {
-  final List<_BrowserTab> tabs;
-  final int activeIndex;
-  final ValueChanged<int> onSelect;
-  final ValueChanged<int> onClose;
-  final VoidCallback onAdd;
+class _HistoryPanel extends StatelessWidget {
+  final List<BrowserHistoryEntry> entries;
+  final ValueChanged<String> onOpen;
+  final VoidCallback onClear;
+  final VoidCallback onClose;
 
-  const _TabStrip({
-    required this.tabs,
-    required this.activeIndex,
-    required this.onSelect,
+  const _HistoryPanel({
+    required this.entries,
+    required this.onOpen,
+    required this.onClear,
     required this.onClose,
-    required this.onAdd,
   });
+
+  static String _formatTime(DateTime dt) {
+    final d = dt.toLocal();
+    two(int n) => n.toString().padLeft(2, '0');
+    return '${two(d.day)}/${two(d.month)} ${two(d.hour)}:${two(d.minute)}';
+  }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Container(
-      height: 36,
-      color: cs.surfaceContainerHighest,
-      child: Row(children: [
-        Expanded(
-          child: ListView.builder(
-            scrollDirection: Axis.horizontal,
-            itemCount:       tabs.length,
-            itemBuilder: (context, i) {
-              final tab      = tabs[i];
-              final selected = i == activeIndex;
-              final label = tab.title.isNotEmpty
-                  ? tab.title
-                  : (tab.urlCtrl.text.isNotEmpty ? tab.urlCtrl.text : 'Nouvel onglet');
 
-              return GestureDetector(
-                onTap: () => onSelect(i),
-                child: Container(
-                  constraints: const BoxConstraints(minWidth: 120, maxWidth: 220),
-                  margin:  const EdgeInsets.only(right: 2, top: 4),
-                  padding: const EdgeInsets.symmetric(horizontal: 10),
-                  decoration: BoxDecoration(
-                    color: selected ? cs.surface : Colors.transparent,
-                    borderRadius: const BorderRadius.vertical(top: Radius.circular(6)),
-                  ),
-                  child: Row(children: [
-                    if (tab.loading)
-                      SizedBox(
-                        width: 10, height: 10,
-                        child: CircularProgressIndicator(strokeWidth: 1.5, color: cs.primary),
-                      )
-                    else
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 320),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHigh,
+        border: Border(bottom: BorderSide(color: cs.outlineVariant)),
+      ),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(children: [
+            Icon(Icons.history, size: 16, color: cs.onSurfaceVariant),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text('Historique de navigation (${entries.length})',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: cs.onSurface)),
+            ),
+            if (entries.isNotEmpty)
+              TextButton.icon(
+                onPressed: onClear,
+                icon:  const Icon(Icons.delete_outline, size: 15),
+                label: const Text('Effacer', style: TextStyle(fontSize: 12)),
+              ),
+            IconButton(
+              icon: const Icon(Icons.close, size: 18),
+              tooltip: 'Fermer',
+              onPressed: onClose,
+            ),
+          ]),
+        ),
+        if (entries.isEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: Text('Aucune page visitée pour le moment.',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+          )
+        else
+          Flexible(
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount:  entries.length,
+              itemBuilder: (context, i) {
+                final e = entries[i];
+                final label = e.title.isNotEmpty ? e.title : e.url;
+                return InkWell(
+                  onTap: () => onOpen(e.url),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                    child: Row(children: [
                       Icon(Icons.public, size: 14, color: cs.onSurfaceVariant),
-                    const SizedBox(width: 6),
-                    Expanded(
-                      child: Text(
-                        label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize:   12,
-                          fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(label, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 12.5)),
+                            Text(e.url, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                          ],
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 4),
-                    InkWell(
-                      onTap: () => onClose(i),
-                      borderRadius: BorderRadius.circular(10),
-                      child: Padding(
-                        padding: const EdgeInsets.all(2),
-                        child: Icon(Icons.close, size: 13, color: cs.onSurfaceVariant),
-                      ),
-                    ),
-                  ]),
-                ),
-              );
-            },
+                      const SizedBox(width: 8),
+                      Text(_formatTime(e.visitedAt),
+                          style: TextStyle(fontSize: 10.5, color: cs.onSurfaceVariant)),
+                    ]),
+                  ),
+                );
+              },
+            ),
           ),
-        ),
-        IconButton(
-          icon:    const Icon(Icons.add, size: 18),
-          tooltip: 'Nouvel onglet',
-          onPressed: onAdd,
-        ),
       ]),
     );
   }

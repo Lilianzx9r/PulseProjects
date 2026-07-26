@@ -1,34 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../common/browser_history_entry.dart';
+import 'android_browser_history_store.dart';
 import 'android_profile.dart';
 import 'android_profile_picker_screen.dart';
 import 'android_profile_repository.dart';
-
-/// État d'un onglet du navigateur mobile : un WebViewController dédié
-/// (même profil Android que les autres onglets → session/cookies
-/// partagés, cf. WebView.setDataDirectorySuffix() appliqué une fois par
-/// process), sa barre d'URL et son statut de chargement.
-class _MobileTab {
-  _MobileTab({required this.id, required this.homeUrl});
-
-  final String id;
-  final String homeUrl;
-
-  late final WebViewController ctrl;
-  final TextEditingController urlCtrl  = TextEditingController();
-  final FocusNode              urlFocus = FocusNode();
-
-  bool loading = true;
-  String title = '';
-}
 
 /// Navigateur plein écran pour le profil Android actif. Le contexte
 /// (cookies, session, stockage local…) est persistant grâce au suffixe
 /// WebView.setDataDirectorySuffix() appliqué côté natif au démarrage du
 /// process (voir PulseApplication.kt), correspondant à [profile.id].
-/// Plusieurs onglets peuvent être ouverts simultanément dans ce même
-/// profil : ils partagent tous le même contexte de session.
 class AndroidBrowserScreen extends StatefulWidget {
   final AndroidProfile profile;
   final AndroidProfileRepository repository;
@@ -44,92 +26,75 @@ class AndroidBrowserScreen extends StatefulWidget {
 }
 
 class _AndroidBrowserScreenState extends State<AndroidBrowserScreen> {
-  final List<_MobileTab> _tabs = [];
-  int _activeIndex = 0;
+  late final WebViewController _ctrl;
+  final _urlCtrl  = TextEditingController();
+  final _urlFocus = FocusNode();
+  bool _loading = true;
 
-  _MobileTab get _active => _tabs[_activeIndex];
+  // ── Historique de navigation (persistant, par profil) ──────────────────────
+  bool _showHistory = false;
+  List<BrowserHistoryEntry> _history = [];
 
   @override
   void initState() {
     super.initState();
-    _openTab(widget.profile.homeUrl, activate: true);
+    _urlCtrl.text = widget.profile.homeUrl;
+    _loadHistory();
+
+    _ctrl = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(NavigationDelegate(
+        onPageStarted: (url) {
+          if (!mounted) return;
+          setState(() { _loading = true; });
+          if (!_urlFocus.hasFocus) _urlCtrl.text = url;
+        },
+        onPageFinished: (url) async {
+          if (!mounted) return;
+          setState(() { _loading = false; });
+          if (!_urlFocus.hasFocus) _urlCtrl.text = url;
+          String pageTitle = '';
+          try {
+            final raw = await _ctrl.runJavaScriptReturningResult('document.title');
+            pageTitle = raw.toString().replaceAll('"', '').trim();
+          } catch (_) {}
+          _recordVisit(url, pageTitle);
+        },
+      ))
+      ..loadRequest(Uri.parse(widget.profile.homeUrl));
   }
 
   @override
   void dispose() {
-    for (final tab in _tabs) {
-      tab.urlCtrl.dispose();
-      tab.urlFocus.dispose();
-    }
+    _urlCtrl.dispose();
+    _urlFocus.dispose();
     super.dispose();
   }
 
-  // ── Onglets ──────────────────────────────────────────────────────────────
+  // ── Historique ───────────────────────────────────────────────────────────
 
-  void _openTab(String url, {bool activate = true}) {
-    final tab = _MobileTab(
-      id:      '${DateTime.now().microsecondsSinceEpoch}',
-      homeUrl: url,
-    );
-    tab.urlCtrl.text = url;
-    tab.ctrl = WebViewController()
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..setNavigationDelegate(NavigationDelegate(
-        onPageStarted: (u) {
-          if (!mounted) return;
-          setState(() { tab.loading = true; });
-          if (!tab.urlFocus.hasFocus) tab.urlCtrl.text = u;
-        },
-        onPageFinished: (u) async {
-          if (!mounted) return;
-          setState(() { tab.loading = false; });
-          if (!tab.urlFocus.hasFocus) tab.urlCtrl.text = u;
-          try {
-            final raw = await tab.ctrl.runJavaScriptReturningResult('document.title');
-            final t   = raw.toString().replaceAll('"', '').trim();
-            if (mounted) setState(() => tab.title = t);
-          } catch (_) {}
-        },
-      ))
-      ..loadRequest(Uri.parse(url));
-
-    setState(() {
-      _tabs.add(tab);
-      if (activate) _activeIndex = _tabs.length - 1;
-    });
+  Future<void> _loadHistory() async {
+    final history = await AndroidBrowserHistoryStore.load(widget.profile.id);
+    if (mounted) setState(() => _history = history);
   }
 
-  void _addTab() => _openTab(widget.profile.homeUrl, activate: true);
-
-  void _selectTab(int i) {
-    if (i == _activeIndex) return;
-    setState(() => _activeIndex = i);
+  Future<void> _recordVisit(String url, String title) async {
+    if (url.isEmpty) return;
+    final entry = BrowserHistoryEntry(url: url, title: title, visitedAt: DateTime.now());
+    final updated = await AndroidBrowserHistoryStore.append(widget.profile.id, entry);
+    if (mounted) setState(() => _history = updated);
   }
 
-  void _closeTab(int i) {
-    if (_tabs.length <= 1) {
-      // Fermer le dernier onglet quitte le navigateur, comme un retour
-      // au sélecteur de profil.
-      _changeProfile();
-      return;
-    }
-    setState(() {
-      _tabs[i].urlCtrl.dispose();
-      _tabs[i].urlFocus.dispose();
-      _tabs.removeAt(i);
-      if (_activeIndex >= _tabs.length) {
-        _activeIndex = _tabs.length - 1;
-      } else if (i < _activeIndex) {
-        _activeIndex--;
-      }
-    });
+  Future<void> _clearHistory() async {
+    await AndroidBrowserHistoryStore.clear(widget.profile.id);
+    if (mounted) setState(() => _history = []);
   }
 
   void _navigate() {
-    var v = _active.urlCtrl.text.trim();
+    var v = _urlCtrl.text.trim();
     if (v.isEmpty) return;
     if (!v.startsWith('http://') && !v.startsWith('https://')) v = 'https://$v';
-    _active.ctrl.loadRequest(Uri.parse(v));
+    _ctrl.loadRequest(Uri.parse(v));
   }
 
   void _changeProfile() {
@@ -147,14 +112,15 @@ class _AndroidBrowserScreenState extends State<AndroidBrowserScreen> {
 
   @override
   Widget build(BuildContext context) {
-    if (_tabs.isEmpty) {
-      return const Scaffold(body: Center(child: CircularProgressIndicator()));
-    }
-
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.profile.name),
         actions: [
+          IconButton(
+            tooltip: _showHistory ? 'Fermer l\'historique' : 'Historique de navigation',
+            icon: Icon(_showHistory ? Icons.history : Icons.history_outlined),
+            onPressed: () => setState(() => _showHistory = !_showHistory),
+          ),
           IconButton(
             tooltip: 'Changer de profil',
             icon: const Icon(Icons.switch_account_outlined),
@@ -163,35 +129,28 @@ class _AndroidBrowserScreenState extends State<AndroidBrowserScreen> {
         ],
       ),
       body: Column(children: [
-        _MobileTabStrip(
-          tabs:        _tabs,
-          activeIndex: _activeIndex,
-          onSelect:    _selectTab,
-          onClose:     _closeTab,
-          onAdd:       _addTab,
-        ),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
           child: Row(children: [
             IconButton(
               icon: const Icon(Icons.arrow_back),
               tooltip: 'Précédent',
-              onPressed: () => _active.ctrl.goBack(),
+              onPressed: () => _ctrl.goBack(),
             ),
             IconButton(
               icon: const Icon(Icons.arrow_forward),
               tooltip: 'Suivant',
-              onPressed: () => _active.ctrl.goForward(),
+              onPressed: () => _ctrl.goForward(),
             ),
             IconButton(
               icon: const Icon(Icons.refresh),
               tooltip: 'Recharger',
-              onPressed: () => _active.ctrl.reload(),
+              onPressed: () => _ctrl.reload(),
             ),
             Expanded(
               child: TextField(
-                controller: _active.urlCtrl,
-                focusNode:  _active.urlFocus,
+                controller: _urlCtrl,
+                focusNode:  _urlFocus,
                 decoration: InputDecoration(
                   isDense: true,
                   contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -203,114 +162,121 @@ class _AndroidBrowserScreenState extends State<AndroidBrowserScreen> {
             ),
           ]),
         ),
-        if (_active.loading) const LinearProgressIndicator(minHeight: 2),
-        // IndexedStack conserve tous les WebView montés (au lieu de les
-        // recréer à chaque changement d'onglet) : contrairement au port
-        // Windows, webview_flutter (WebView Android natif) n'a pas de
-        // contrainte de Z-order avec des vues natives flottantes, donc
-        // garder plusieurs WebView vivantes simultanément est sûr et
-        // évite de perdre la position de défilement ou l'état de la page
-        // en changeant d'onglet.
-        Expanded(
-          child: IndexedStack(
-            index: _activeIndex,
-            children: [
-              for (final tab in _tabs) WebViewWidget(controller: tab.ctrl),
-            ],
+        if (_loading) const LinearProgressIndicator(minHeight: 2),
+        if (_showHistory)
+          _MobileHistoryPanel(
+            entries: _history,
+            onOpen: (url) {
+              _urlCtrl.text = url;
+              _navigate();
+              setState(() => _showHistory = false);
+            },
+            onClear: _clearHistory,
+            onClose: () => setState(() => _showHistory = false),
           ),
-        ),
+        Expanded(child: WebViewWidget(controller: _ctrl)),
       ]),
     );
   }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Barre d'onglets (mobile)
+// Panneau Historique (mobile)
 // ─────────────────────────────────────────────────────────────────────────────
 
-class _MobileTabStrip extends StatelessWidget {
-  final List<_MobileTab> tabs;
-  final int activeIndex;
-  final ValueChanged<int> onSelect;
-  final ValueChanged<int> onClose;
-  final VoidCallback onAdd;
+class _MobileHistoryPanel extends StatelessWidget {
+  final List<BrowserHistoryEntry> entries;
+  final ValueChanged<String> onOpen;
+  final VoidCallback onClear;
+  final VoidCallback onClose;
 
-  const _MobileTabStrip({
-    required this.tabs,
-    required this.activeIndex,
-    required this.onSelect,
+  const _MobileHistoryPanel({
+    required this.entries,
+    required this.onOpen,
+    required this.onClear,
     required this.onClose,
-    required this.onAdd,
   });
+
+  static String _formatTime(DateTime dt) {
+    final d = dt.toLocal();
+    two(int n) => n.toString().padLeft(2, '0');
+    return '${two(d.day)}/${two(d.month)} ${two(d.hour)}:${two(d.minute)}';
+  }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Container(
-      height: 40,
-      color: cs.surfaceContainerHighest,
-      child: Row(children: [
-        Expanded(
-          child: ListView.builder(
-            scrollDirection: Axis.horizontal,
-            itemCount:       tabs.length,
-            itemBuilder: (context, i) {
-              final tab      = tabs[i];
-              final selected = i == activeIndex;
-              final label = tab.title.isNotEmpty
-                  ? tab.title
-                  : (tab.urlCtrl.text.isNotEmpty ? tab.urlCtrl.text : 'Nouvel onglet');
 
-              return GestureDetector(
-                onTap: () => onSelect(i),
-                child: Container(
-                  constraints: const BoxConstraints(minWidth: 100, maxWidth: 160),
-                  margin:  const EdgeInsets.only(right: 2, top: 4),
-                  padding: const EdgeInsets.symmetric(horizontal: 8),
-                  decoration: BoxDecoration(
-                    color: selected ? cs.surface : Colors.transparent,
-                    borderRadius: const BorderRadius.vertical(top: Radius.circular(6)),
-                  ),
-                  child: Row(children: [
-                    if (tab.loading)
-                      SizedBox(
-                        width: 10, height: 10,
-                        child: CircularProgressIndicator(strokeWidth: 1.5, color: cs.primary),
-                      )
-                    else
-                      Icon(Icons.public, size: 13, color: cs.onSurfaceVariant),
-                    const SizedBox(width: 5),
-                    Expanded(
-                      child: Text(
-                        label,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize:   11,
-                          fontWeight: selected ? FontWeight.w600 : FontWeight.normal,
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 320),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHigh,
+        border: Border(bottom: BorderSide(color: cs.outlineVariant)),
+      ),
+      child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(children: [
+            Icon(Icons.history, size: 16, color: cs.onSurfaceVariant),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text('Historique (${entries.length})',
+                  style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600, color: cs.onSurface)),
+            ),
+            if (entries.isNotEmpty)
+              TextButton.icon(
+                onPressed: onClear,
+                icon:  const Icon(Icons.delete_outline, size: 15),
+                label: const Text('Effacer', style: TextStyle(fontSize: 12)),
+              ),
+            IconButton(
+              icon: const Icon(Icons.close, size: 18),
+              tooltip: 'Fermer',
+              onPressed: onClose,
+            ),
+          ]),
+        ),
+        if (entries.isEmpty)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 16),
+            child: Text('Aucune page visitée pour le moment.',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+          )
+        else
+          Flexible(
+            child: ListView.builder(
+              shrinkWrap: true,
+              itemCount:  entries.length,
+              itemBuilder: (context, i) {
+                final e = entries[i];
+                final label = e.title.isNotEmpty ? e.title : e.url;
+                return InkWell(
+                  onTap: () => onOpen(e.url),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    child: Row(children: [
+                      Icon(Icons.public, size: 14, color: cs.onSurfaceVariant),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(label, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(fontSize: 12.5)),
+                            Text(e.url, maxLines: 1, overflow: TextOverflow.ellipsis,
+                                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                          ],
                         ),
                       ),
-                    ),
-                    const SizedBox(width: 2),
-                    InkWell(
-                      onTap: () => onClose(i),
-                      borderRadius: BorderRadius.circular(10),
-                      child: Padding(
-                        padding: const EdgeInsets.all(2),
-                        child: Icon(Icons.close, size: 12, color: cs.onSurfaceVariant),
-                      ),
-                    ),
-                  ]),
-                ),
-              );
-            },
+                      const SizedBox(width: 8),
+                      Text(_formatTime(e.visitedAt),
+                          style: TextStyle(fontSize: 10.5, color: cs.onSurfaceVariant)),
+                    ]),
+                  ),
+                );
+              },
+            ),
           ),
-        ),
-        IconButton(
-          icon:    const Icon(Icons.add, size: 18),
-          tooltip: 'Nouvel onglet',
-          onPressed: onAdd,
-        ),
       ]),
     );
   }
